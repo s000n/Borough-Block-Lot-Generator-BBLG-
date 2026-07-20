@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<!--
+  BBL Generator
+  NYC Landmarks Preservation Commission — Survey Data Tool
+
+  Built during the 2026 SYEP internship at LPC by Wilson Lee,
+  assisted by Claude (Anthropic) as a co-development tool.
+
+  Purpose:
+    Automates construction of the 10-digit NYC BBL (Borough-Block-Lot)
+    identifier from survey spreadsheets that contain separate Borough,
+    Block, and Lot columns. The BBL is appended as a new column to the
+    original data and exported as a new Excel file.
+
+  BBL format: B OOOOO LLLL (always 10 digits, zero-padded)
+    B     = Borough code (1=Manhattan, 2=Bronx, 3=Brooklyn, 4=Queens, 5=Staten Island)
+    OOOOO = Block number, padded to 5 digits
+    LLLL  = Lot number, padded to 4 digits
+  Example: Brooklyn (3), Block 1795, Lot 6 → 3017950006
+
+  Features:
+    - Drag-and-drop or browse Excel file upload (.xlsx, .xls, .xlsm)
+    - Auto-detects Borough, Block, Lot columns (fuzzy match for wrapped headers)
+    - Borough detection: column data → filename keyword → manual override
+    - Multi-sheet support: sheet selector appears for files with multiple tabs
+    - Date column preservation: converts Excel serial dates to MM/DD/YYYY strings
+    - Output column ordering: BBL appended immediately after last data column
+    - Explicit cell typing on output: prevents Excel from coercing hyphenated
+      addresses or BBL numbers into numeric values
+    - Diff checker: compares output against input to flag unexpected changes
+    - Runs entirely client-side — no server, no install, no data leaves the browser
+
+  Dependencies:
+    - SheetJS (xlsx) v0.18.5 via cdnjs (Excel read/write)
+    - IBM Plex Mono + Inter via Google Fonts
+
+  Known limitations:
+    - Date serials below 30000 (pre-1982) are not converted, to avoid
+      misinterpreting plain year values (e.g. "1967") as dates
+    - Hyphenated Queens addresses (e.g. 88-04) are preserved as strings
+      but may still display as text in older Excel versions
+    - Files with no Block or Lot column cannot be processed
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BBL Generator — LPC</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root {
+    --bg:      #0E0E1A;
+    --surface: #16162A;
+    --surface2:#1E1E36;
+    --border:  rgba(255,255,255,0.08);
+    --red:     #C41230;
+    --green:   #3D9970;
+    --yellow:  #D4A843;
+    --cream:   #F0EBE0;
+    --dim:     #8A8AA0;
+    --mono:    'IBM Plex Mono', monospace;
+    --sans:    'Inter', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--cream);
+    font-family: var(--sans);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+  }
+
+  .header {
+    width: 100%;
+    max-width: 760px;
+    margin-bottom: 32px;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+  }
+
+  .lpc-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    background: var(--red);
+    color: white;
+    padding: 3px 7px;
+    letter-spacing: 0.1em;
+    flex-shrink: 0;
+  }
+
+  .header h1 {
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--cream);
+    letter-spacing: 0.03em;
+  }
+
+  .header-sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+    margin-left: auto;
+  }
+
+  .main {
+    width: 100%;
+    max-width: 760px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .dropzone {
+    border: 1px dashed rgba(196,18,48,0.4);
+    background: var(--surface);
+    padding: 48px 32px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    position: relative;
+  }
+
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--red);
+    background: rgba(196,18,48,0.05);
+  }
+
+  .dropzone input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+    width: 100%;
+  }
+
+  .drop-icon  { font-size: 28px; margin-bottom: 12px; opacity: 0.5; }
+  .drop-label { font-family: var(--mono); font-size: 13px; color: var(--cream); margin-bottom: 6px; }
+  .drop-sub   { font-size: 11px; color: var(--dim); font-family: var(--mono); }
+
+  .config-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .config-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 14px 16px;
+  }
+
+  .config-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 8px;
+  }
+
+  select, input[type="text"] {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--cream);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 8px 10px;
+    outline: none;
+    appearance: none;
+    transition: border-color 0.15s;
+  }
+
+  select:focus, input[type="text"]:focus { border-color: rgba(196,18,48,0.5); }
+
+  .log-panel { background: var(--surface); border: 1px solid var(--border); display: none; }
+  .log-panel.active { display: block; }
+
+  .log-header {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .log-body {
+    padding: 14px 16px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.7;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .log-line      { color: var(--dim); }
+  .log-line.ok   { color: var(--green); }
+  .log-line.warn { color: var(--yellow); }
+  .log-line.err  { color: var(--red); }
+  .log-line.info { color: var(--cream); }
+
+  .preview-panel { background: var(--surface); border: 1px solid var(--border); display: none; }
+  .preview-panel.active { display: block; }
+
+  .preview-header {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .preview-scroll { overflow-x: auto; max-height: 260px; overflow-y: auto; }
+
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11px; }
+
+  th {
+    background: var(--surface2);
+    color: var(--dim);
+    padding: 7px 12px;
+    text-align: left;
+    font-weight: 500;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+
+  th.bbl-col { color: var(--green); }
+
+  td {
+    padding: 6px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    white-space: nowrap;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--dim);
+  }
+
+  td.bbl-val  { color: var(--green); font-weight: 500; }
+  td.bbl-null { color: var(--red); opacity: 0.6; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+
+  .stats-row {
+    display: none;
+    gap: 24px;
+    padding: 12px 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .stats-row.active { display: flex; }
+
+  .stat        { display: flex; flex-direction: column; gap: 2px; }
+  .stat-num    { font-family: var(--mono); font-size: 20px; font-weight: 600; color: var(--cream); }
+  .stat-label  { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+  .stat-num.green  { color: var(--green); }
+  .stat-num.yellow { color: var(--yellow); }
+  .stat-num.red    { color: var(--red); }
+
+  .actions {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+  }
+
+  .btn {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 12px 20px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--cream);
+    transition: all 0.15s;
+    letter-spacing: 0.04em;
+  }
+
+  .btn:hover    { border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.04); }
+  .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  .btn-primary       { background: var(--red); border-color: var(--red); color: white; }
+  .btn-primary:hover { background: #a00e25; border-color: #a00e25; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="lpc-tag">LPC</div>
+  <h1>BBL GENERATOR</h1>
+  <span class="header-sub">Borough · Block · Lot → 10-digit BBL</span>
+</div>
+
+<div class="main">
+
+  <div class="dropzone" id="dropzone">
+    <input type="file" id="file-input" accept=".xlsx,.xls,.xlsm">
+    <div class="drop-icon">📋</div>
+    <div class="drop-label">Drop Excel file here or click to browse</div>
+    <div class="drop-sub">.xlsx · .xls · .xlsm — one file at a time</div>
+  </div>
+
+  <div class="config-row">
+    <div class="config-block">
+      <div class="config-label">Borough override</div>
+      <select id="borough-override">
+        <option value="auto">Auto-detect from data / filename</option>
+        <option value="1">1 — Manhattan</option>
+        <option value="2">2 — Bronx</option>
+        <option value="3">3 — Brooklyn</option>
+        <option value="4">4 — Queens</option>
+        <option value="5">5 — Staten Island</option>
+      </select>
+    </div>
+    <div class="config-block">
+      <div class="config-label">Output filename suffix</div>
+      <input type="text" id="suffix-input" value="_BBL" placeholder="_BBL">
+    </div>
+  </div>
+
+  <!-- Sheet selector — only visible for multi-sheet files -->
+  <div class="config-block" id="sheet-selector" style="display:none">
+    <div class="config-label">Sheet</div>
+    <select id="sheet-select" onchange="switchSheet()"></select>
+  </div>
+
+  <div class="log-panel" id="log-panel">
+    <div class="log-header">
+      <span>Processing log</span>
+      <span id="log-status">—</span>
+    </div>
+    <div class="log-body" id="log-body"></div>
+  </div>
+
+  <div class="stats-row" id="stats-row">
+    <div class="stat"><div class="stat-num"        id="s-total">—</div><div class="stat-label">total rows</div></div>
+    <div class="stat"><div class="stat-num green"  id="s-filled">—</div><div class="stat-label">BBL filled</div></div>
+    <div class="stat"><div class="stat-num yellow" id="s-blank">—</div><div class="stat-label">blank block/lot</div></div>
+    <div class="stat"><div class="stat-num red"    id="s-err">—</div><div class="stat-label">errors</div></div>
+  </div>
+
+  <div class="preview-panel" id="preview-panel">
+    <div class="preview-header">
+      <span>Preview — first 20 rows</span>
+      <span id="preview-meta" style="color:var(--dim)">—</span>
+    </div>
+    <div class="preview-scroll">
+      <table id="preview-table"></table>
+    </div>
+  </div>
+
+  <!-- Diff panel — shown after processing, flags unexpected value changes -->
+  <div class="log-panel" id="diff-panel" style="display:none">
+    <div class="log-header">
+      <span>Diff check — unexpected changes</span>
+      <span id="diff-status">—</span>
+    </div>
+    <div class="log-body" id="diff-body"></div>
+    <div style="padding:10px 16px;border-top:1px solid var(--border)">
+      <div class="preview-scroll" style="max-height:200px">
+        <table id="diff-table" style="display:none"></table>
+      </div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="btn" id="reset-btn" onclick="resetTool()" disabled>↺ Reset</button>
+    <button class="btn btn-primary" id="download-btn" onclick="downloadOutput()" disabled>↓ Download Excel</button>
+  </div>
+
+</div>
+
+<script>
+// =============================================================================
+// Borough code lookup
+// Maps borough names and common abbreviations to NYC borough codes 1–5.
+// Used when resolving the Borough column in a dataset.
+// =============================================================================
+const BOROUGH_CODES = {
+  'manhattan':1, 'new york':1, 'ny':1, 'mn':1,
+  'bronx':2, 'bx':2,
+  'brooklyn':3, 'bk':3, 'bklyn':3, 'kings':3,
+  'queens':4, 'qn':4, 'qns':4,
+  'staten island':5, 'staten':5, 'si':5, 'richmond':5
+};
+
+// Filename keyword hints — used when no Borough column exists.
+// Keys are lowercase substrings of the filename; values are borough codes.
+// LPC-specific survey area names are included here based on known file naming.
+const FILENAME_HINTS = {
+  'manhattan':1, 'midtown':1, 'upper east':1, 'upper west':1,
+  'bronx':2,
+  'brooklyn':3, 'bklyn':3, 'ditmas':3, 'alice agate':3,
+  'queens':4, 'addisleigh':4, 'district 7':4, 'district 8':4,
+  'seneca':4, 'woodbine':4, 'palmetto':4,
+  'staten':5
+};
+
+// =============================================================================
+// Application state
+// =============================================================================
+let outputWorkbook  = null;  // processed XLSX workbook ready for download
+let outputFilename  = '';
+let originalRows    = null;  // normalized input rows (pre-BBL) for diff check
+let originalHeaders = null;
+let processedRows   = null;  // output rows including BBL column
+let processedHeaders= null;
+let dateColSet      = null;  // Set of column indices identified as date columns
+let activeWorkbook  = null;  // raw input workbook (kept for sheet switching)
+let activeFilename  = '';
+
+// =============================================================================
+// Logging
+// =============================================================================
+function log(msg, type = '') {
+  const body = document.getElementById('log-body');
+  const line = document.createElement('div');
+  line.className = 'log-line ' + type;
+  line.textContent = msg;
+  body.appendChild(line);
+  body.scrollTop = body.scrollHeight;
+  document.getElementById('log-panel').classList.add('active');
+}
+
+function setLogStatus(msg) {
+  document.getElementById('log-status').textContent = msg;
+}
+
+// =============================================================================
+// Column finder
+// Normalizes whitespace and case before matching, so "Bloc k" matches "Block".
+// Returns the original (un-normalized) header string on match.
+// =============================================================================
+function normalizeHeader(s) { return String(s).replace(/\s+/g, '').toLowerCase(); }
+
+function findCol(headers, candidates) {
+  const normed = headers.map(h => normalizeHeader(h));
+  for (const c of candidates) {
+    const idx = normed.indexOf(normalizeHeader(c));
+    if (idx >= 0) return headers[idx];
+  }
+  return null;
+}
+
+// =============================================================================
+// Borough resolution
+// Accepts a cell value from the Borough column and returns a numeric code.
+// Handles digit strings ('3'), full names ('Brooklyn'), and abbreviations ('BK').
+// =============================================================================
+function resolveBorough(val) {
+  if (val === null || val === undefined || val === '') return null;
+  const v = String(val).trim().toLowerCase();
+  if (['1','2','3','4','5'].includes(v)) return parseInt(v);
+  for (const [name, code] of Object.entries(BOROUGH_CODES)) {
+    if (v === name || v.startsWith(name)) return code;
+  }
+  return null;
+}
+
+function boroughFromFilename(name) {
+  const n = name.toLowerCase();
+  for (const [kw, code] of Object.entries(FILENAME_HINTS)) {
+    if (n.includes(kw)) return code;
+  }
+  return null;
+}
+
+// =============================================================================
+// BBL construction
+// Pads block to 5 digits and lot to 4 digits, prepends borough code.
+// Returns null if any component is missing or non-numeric.
+// =============================================================================
+function buildBBL(borough, block, lot) {
+  try {
+    const b  = parseInt(borough);
+    const bl = parseInt(parseFloat(String(block).trim()));
+    const lt = parseInt(parseFloat(String(lot).trim()));
+    if (isNaN(b) || isNaN(bl) || isNaN(lt)) return null;
+    return `${b}${String(bl).padStart(5, '0')}${String(lt).padStart(4, '0')}`;
+  } catch {
+    return null;
+  }
+}
+
+// =============================================================================
+// Excel serial date conversion
+// Excel stores dates as days since January 0, 1900 (with a deliberate
+// leap year bug at 1900-02-29). Serial 25569 = January 1, 1970 (Unix epoch).
+// The threshold of 30000 (≈ October 1982) prevents plain year values like
+// "1967" from being mistakenly converted.
+// =============================================================================
+function excelDateToString(serial) {
+  if (typeof serial !== 'number' || serial < 30000) return serial;
+  const date = new Date(Math.round((serial - 25569) * 86400 * 1000));
+  if (isNaN(date.getTime())) return serial;
+  return String(date.getUTCMonth() + 1).padStart(2, '0') + '/' +
+         String(date.getUTCDate()).padStart(2, '0') + '/' +
+         date.getUTCFullYear();
+}
+
+// =============================================================================
+// Main workbook processor
+// Reads the first sheet of wb, detects columns, constructs BBL,
+// and returns a new workbook with the BBL column appended.
+// =============================================================================
+function processWorkbook(wb, filename) {
+  const sheetName = wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+
+  // Initial read to find the rightmost non-empty header.
+  // This caps the column range and prevents ghost columns (hidden or merged
+  // cell artifacts that extend the sheet's !ref beyond the visible data).
+  const rawFull = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', cellDates: true });
+  if (rawFull.length < 2) { log('File appears empty', 'err'); return null; }
+
+  const firstRow = rawFull[0] || [];
+  let maxCol = 0;
+  for (let i = firstRow.length - 1; i >= 0; i--) {
+    if (firstRow[i] !== null && firstRow[i] !== undefined && String(firstRow[i]).trim() !== '') {
+      maxCol = i; break;
+    }
+  }
+
+  // Re-read with the capped column range so row arrays are the correct width.
+  // We modify ws['!ref'] in place (then restore it) because SheetJS uses it
+  // to determine which cells to include; spreading ws would drop cell metadata.
+  const origRef = ws['!ref'];
+  if (origRef) {
+    const r = XLSX.utils.decode_range(origRef);
+    r.e.c = maxCol;
+    ws['!ref'] = XLSX.utils.encode_range(r);
+  }
+  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', cellDates: true });
+  if (origRef) ws['!ref'] = origRef;
+
+  const headers = (raw[0] || []).map(h => String(h ?? ''));
+  const rows    = raw.slice(1).map(row => headers.map((_, i) => row[i] ?? ''));
+
+  log(`Sheet: "${sheetName}" — ${rows.length} rows, ${headers.length} columns`, 'info');
+
+  // Date column detection:
+  // 1. Header name contains "date" — reliable for .xls files where cell
+  //    type metadata ('d') is often absent.
+  // 2. Cell type metadata scan — catches date-formatted numeric cells in .xlsx.
+  const dateColIndices = new Set();
+
+  headers.forEach((h, i) => {
+    if (h && h.toLowerCase().includes('date')) dateColIndices.add(i);
+  });
+
+  if (origRef) {
+    const range = XLSX.utils.decode_range(origRef);
+    for (let C = range.s.c; C <= Math.min(maxCol, range.e.c); C++) {
+      for (let R = range.s.r + 1; R <= Math.min(range.s.r + 5, range.e.r); R++) {
+        const cell = ws[XLSX.utils.encode_cell({ r: R, c: C })];
+        if (cell && (
+          cell.t === 'd' ||
+          (cell.t === 'n' && cell.z && /[yYdD]/.test(cell.z) && !/[#0]/.test(cell.z))
+        )) {
+          dateColIndices.add(C);
+        }
+      }
+    }
+  }
+
+  if (dateColIndices.size > 0) {
+    log(`Date columns: ${[...dateColIndices].map(i => `"${headers[i] || i}"`).join(', ')}`, '');
+  }
+
+  // Normalize cell values:
+  // - JS Date objects (from cellDates:true) → MM/DD/YYYY string
+  // - Numeric serials in detected date columns → MM/DD/YYYY string
+  // - Everything else passes through unchanged
+  const normalizeCell = (val, colIdx) => {
+    if (val instanceof Date) {
+      return String(val.getMonth() + 1).padStart(2, '0') + '/' +
+             String(val.getDate()).padStart(2, '0') + '/' +
+             val.getFullYear();
+    }
+    if (typeof val === 'number' && val > 30000 && dateColIndices.has(colIdx)) {
+      return excelDateToString(val);
+    }
+    return val;
+  };
+
+  const normRows = rows.map(row => row.map((val, i) => normalizeCell(val, i)));
+
+  log(`Trimmed to ${headers.length} columns (last: "${headers[headers.length - 1]}")`, '');
+
+  // Column detection
+  const blockCol   = findCol(headers, ['Block', 'Bloc k', 'BLOCK', 'block', 'Blk']);
+  const lotCol     = findCol(headers, ['Lot', 'LOT', 'lot']);
+  const boroughCol = findCol(headers, ['Borough', 'Boroug h', 'BOROUGH', 'borough', 'Boro']);
+
+  if (!blockCol) log('WARNING: No Block column found', 'warn');
+  if (!lotCol)   log('WARNING: No Lot column found', 'warn');
+  log(`Block: "${blockCol || '?'}" | Lot: "${lotCol || '?'}" | Borough: "${boroughCol || 'not found'}"`, '');
+
+  // Borough source priority: manual override → column data → filename hint → default
+  const override = document.getElementById('borough-override').value;
+  let fixedBorough = null;
+
+  if (override !== 'auto') {
+    fixedBorough = parseInt(override);
+    log(`Borough override: ${override}`, 'ok');
+  } else if (!boroughCol) {
+    fixedBorough = boroughFromFilename(filename);
+    if (fixedBorough) {
+      log(`Borough inferred from filename: ${fixedBorough}`, 'ok');
+    } else {
+      fixedBorough = 3;
+      log('Borough unknown — defaulting to 3 (Brooklyn). Verify this is correct.', 'warn');
+    }
+  } else {
+    log(`Using borough column: "${boroughCol}"`, 'ok');
+  }
+
+  // If a BBL column already has data, write to BBL_Generated instead
+  const existingBBL = findCol(headers, ['BBL', 'bbl']);
+  const bblColName  = (existingBBL && normRows.some(r => r[headers.indexOf(existingBBL)]))
+    ? 'BBL_Generated' : 'BBL';
+
+  const blockIdx   = blockCol   ? headers.indexOf(blockCol)   : -1;
+  const lotIdx     = lotCol     ? headers.indexOf(lotCol)     : -1;
+  const boroughIdx = boroughCol ? headers.indexOf(boroughCol) : -1;
+
+  let filled = 0, blank = 0, errs = 0;
+
+  const bbls = normRows.map(row => {
+    const block   = blockIdx   >= 0 ? row[blockIdx]   : '';
+    const lot     = lotIdx     >= 0 ? row[lotIdx]     : '';
+    const borough = boroughIdx >= 0
+      ? resolveBorough(row[boroughIdx]) || fixedBorough
+      : fixedBorough;
+
+    if (!block || String(block).trim() === '') { blank++; return ''; }
+
+    const bbl = buildBBL(borough, block, lot);
+    if (!bbl) { errs++; return 'ERROR'; }
+    filled++;
+    return bbl;
+  });
+
+  log(`BBL filled: ${filled} | Blank block/lot: ${blank} | Errors: ${errs}`, filled > 0 ? 'ok' : 'warn');
+
+  const outHeaders = [...headers, bblColName];
+  const outRows    = normRows.map((row, i) => [...row, bbls[i]]);
+
+  // Update stats panel
+  document.getElementById('s-total').textContent  = normRows.length;
+  document.getElementById('s-filled').textContent = filled;
+  document.getElementById('s-blank').textContent  = blank;
+  document.getElementById('s-err').textContent    = errs;
+  document.getElementById('stats-row').classList.add('active');
+
+  renderPreview(outHeaders, outRows, bblColName);
+
+  // Store state for diff check
+  originalRows    = normRows;
+  originalHeaders = headers;
+  processedRows   = outRows;
+  processedHeaders= outHeaders;
+  dateColSet      = dateColIndices;
+
+  // Build output sheet cell by cell with explicit types.
+  // Using aoa_to_sheet would let Excel infer types on re-open, which causes:
+  //   - Hyphenated addresses (e.g. 88-04) to be read as subtraction
+  //   - 10-digit BBL numbers to lose leading zeros or be stored as floats
+  // Writing each cell explicitly with t:'s' (string) and z:'@' (text format)
+  // prevents Excel from touching the value on open.
+  const outData = [outHeaders, ...outRows];
+  const outWS   = {};
+  const wsRange = { s: { r: 0, c: 0 }, e: { r: outData.length - 1, c: outHeaders.length - 1 } };
+
+  for (let R = 0; R < outData.length; R++) {
+    for (let C = 0; C < outHeaders.length; C++) {
+      const cellRef = XLSX.utils.encode_cell({ r: R, c: C });
+      const val     = outData[R][C];
+
+      if (val === null || val === undefined || val === '') {
+        outWS[cellRef] = { t: 's', v: '' };
+        continue;
+      }
+
+      const strVal = String(val);
+      const forceString = (
+        /^\d+-\d/.test(strVal)               ||  // hyphenated: 88-04, 248-250
+        /^0\d/.test(strVal)                  ||  // leading zero
+        /^\d{2}\/\d{2}\/\d{4}$/.test(strVal)||  // date string MM/DD/YYYY
+        (strVal.length === 10 && /^\d{10}$/.test(strVal))  // 10-digit BBL
+      );
+
+      if (forceString) {
+        outWS[cellRef] = { t: 's', v: strVal, z: '@' };
+      } else if (!isNaN(val) && val !== '' && typeof val !== 'boolean') {
+        outWS[cellRef] = { t: 'n', v: Number(val) };
+      } else {
+        outWS[cellRef] = { t: 's', v: strVal };
+      }
+    }
+  }
+
+  outWS['!ref'] = XLSX.utils.encode_range(wsRange);
+
+  const outWB = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(outWB, outWS, sheetName);
+  return outWB;
+}
+
+// =============================================================================
+// Diff checker
+// Compares processed output against normalized input row by row.
+// Date columns are excluded since their conversion is intentional.
+// The BBL column is excluded since it's new.
+// =============================================================================
+function runDiffCheck() {
+  if (!originalRows || !processedRows) return;
+
+  const panel  = document.getElementById('diff-panel');
+  const body   = document.getElementById('diff-body');
+  const status = document.getElementById('diff-status');
+  panel.classList.add('active');
+  panel.style.display = 'block';
+  body.innerHTML = '';
+
+  const bblColName = processedHeaders[processedHeaders.length - 1];
+  const diffs = [];
+
+  for (let ri = 0; ri < originalRows.length; ri++) {
+    for (let ci = 0; ci < originalHeaders.length; ci++) {
+      const colName = originalHeaders[ci];
+      if (colName === bblColName) continue;
+      if (dateColSet && dateColSet.has(ci)) continue;
+
+      const origVal = String(originalRows[ri][ci] ?? '').trim();
+      const outVal  = String(processedRows[ri][ci] ?? '').trim();
+
+      if (origVal !== outVal) {
+        diffs.push({ row: ri + 2, col: colName, orig: origVal, out: outVal });
+      }
+    }
+  }
+
+  if (diffs.length === 0) {
+    const line = document.createElement('div');
+    line.className = 'log-line diff-ok ok';
+    line.textContent = '✓ No unexpected changes — output matches original on all non-BBL, non-date columns';
+    body.appendChild(line);
+    status.textContent = '✓ clean';
+    status.style.color = 'var(--green)';
+  } else {
+    const summary = document.createElement('div');
+    summary.className = 'log-line warn';
+    summary.textContent = `⚠ ${diffs.length} unexpected change${diffs.length > 1 ? 's' : ''} — review below before sending`;
+    body.appendChild(summary);
+    status.textContent = `⚠ ${diffs.length} diff${diffs.length > 1 ? 's' : ''}`;
+    status.style.color = 'var(--yellow)';
+
+    const table = document.getElementById('diff-table');
+    table.style.display = 'table';
+    const shown = diffs.slice(0, 100);
+    table.innerHTML =
+      '<thead><tr><th>Row</th><th>Column</th><th>Original</th><th>Output</th></tr></thead><tbody>' +
+      shown.map(d => `<tr>
+        <td style="color:var(--cream)">${d.row}</td>
+        <td style="color:var(--dim)">${d.col}</td>
+        <td style="color:var(--red)">${d.orig || '(empty)'}</td>
+        <td style="color:var(--yellow)">${d.out || '(empty)'}</td>
+      </tr>`).join('') +
+      '</tbody>';
+
+    if (diffs.length > 100) {
+      const note = document.createElement('div');
+      note.className = 'log-line';
+      note.textContent = `… and ${diffs.length - 100} more (showing first 100)`;
+      body.appendChild(note);
+    }
+  }
+}
+
+// =============================================================================
+// Preview renderer
+// Shows first 20 rows, prioritizing the first 5 columns and the BBL column.
+// =============================================================================
+function renderPreview(headers, rows, bblColName) {
+  const bblIdx  = headers.indexOf(bblColName);
+  const showCols = [...new Set([0, 1, 2, 3, 4, bblIdx])].filter(i => i >= 0 && i < headers.length);
+
+  let html = '<thead><tr>';
+  for (const i of showCols) {
+    html += `<th class="${i === bblIdx ? 'bbl-col' : ''}">${headers[i]}</th>`;
+  }
+  html += '</tr></thead><tbody>';
+
+  for (const row of rows.slice(0, 20)) {
+    html += '<tr>';
+    for (const i of showCols) {
+      const val   = row[i] ?? '';
+      const isBBL = i === bblIdx;
+      const cls   = isBBL ? (!val || val === 'ERROR' ? 'bbl-null' : 'bbl-val') : '';
+      html += `<td class="${cls}" title="${val}">${val || '—'}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody>';
+
+  document.getElementById('preview-table').innerHTML = html;
+  document.getElementById('preview-meta').textContent =
+    `showing ${Math.min(20, rows.length)} of ${rows.length} rows · ${showCols.length} of ${headers.length} cols`;
+  document.getElementById('preview-panel').classList.add('active');
+}
+
+// =============================================================================
+// File handler
+// Reads the file, stores the raw workbook, shows sheet selector if needed,
+// processes the first (or only) sheet, and triggers diff check.
+// =============================================================================
+function handleFile(file) {
+  const filename  = file.name;
+  const nameNoExt = filename.replace(/\.[^.]+$/, '');
+
+  document.getElementById('log-body').innerHTML = '';
+  document.getElementById('log-panel').classList.add('active');
+  setLogStatus('processing...');
+  log(`File: ${filename}`, 'info');
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const wb   = XLSX.read(data, { type: 'array' });
+
+      activeWorkbook = wb;
+      activeFilename = nameNoExt;
+
+      // Show sheet selector only for multi-sheet files
+      const sel        = document.getElementById('sheet-select');
+      const selectorEl = document.getElementById('sheet-selector');
+      sel.innerHTML    = wb.SheetNames.map((n, i) => `<option value="${i}">${n}</option>`).join('');
+      selectorEl.style.display = wb.SheetNames.length > 1 ? 'block' : 'none';
+
+      const result = processWorkbook(wb, nameNoExt);
+      if (result) {
+        outputWorkbook = result;
+        const suffix   = document.getElementById('suffix-input').value || '_BBL';
+        outputFilename = nameNoExt + suffix + '.xlsx';
+        document.getElementById('download-btn').disabled = false;
+        document.getElementById('reset-btn').disabled   = false;
+        setLogStatus('✓ done');
+        log(`Ready to download: ${outputFilename}`, 'ok');
+        runDiffCheck();
+      } else {
+        setLogStatus('failed');
+      }
+    } catch (err) {
+      log('Error: ' + err.message, 'err');
+      setLogStatus('error');
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// =============================================================================
+// Sheet switcher
+// Reprocesses the selected sheet without re-reading the file.
+// Reorders SheetNames so processWorkbook always reads index 0.
+// =============================================================================
+function switchSheet() {
+  if (!activeWorkbook) return;
+
+  const idx       = parseInt(document.getElementById('sheet-select').value);
+  const sheetName = activeWorkbook.SheetNames[idx];
+
+  const reordered = {
+    ...activeWorkbook,
+    SheetNames: [sheetName, ...activeWorkbook.SheetNames.filter((_, i) => i !== idx)]
+  };
+
+  document.getElementById('log-body').innerHTML = '';
+  document.getElementById('diff-panel').classList.remove('active');
+  document.getElementById('diff-panel').style.display = 'none';
+  document.getElementById('diff-body').innerHTML = '';
+  document.getElementById('diff-table').innerHTML = '';
+  document.getElementById('diff-table').style.display = 'none';
+
+  const result = processWorkbook(reordered, activeFilename + '_' + sheetName);
+  if (result) {
+    outputWorkbook = result;
+    const suffix   = document.getElementById('suffix-input').value || '_BBL';
+    outputFilename = activeFilename + '_' + sheetName + suffix + '.xlsx';
+    document.getElementById('download-btn').disabled = false;
+    document.getElementById('reset-btn').disabled   = false;
+    setLogStatus('✓ done');
+    log(`Ready to download: ${outputFilename}`, 'ok');
+    runDiffCheck();
+  }
+}
+
+function downloadOutput() {
+  if (!outputWorkbook) return;
+  XLSX.writeFile(outputWorkbook, outputFilename);
+}
+
+function resetTool() {
+  outputWorkbook   = null; outputFilename   = '';
+  originalRows     = null; originalHeaders  = null;
+  processedRows    = null; processedHeaders = null;
+  dateColSet       = null;
+  activeWorkbook   = null; activeFilename   = '';
+
+  ['log-panel','preview-panel'].forEach(id => document.getElementById(id).classList.remove('active'));
+  document.getElementById('diff-panel').classList.remove('active');
+  document.getElementById('diff-panel').style.display = 'none';
+  document.getElementById('stats-row').classList.remove('active');
+  document.getElementById('log-body').innerHTML      = '';
+  document.getElementById('preview-table').innerHTML = '';
+  document.getElementById('diff-body').innerHTML     = '';
+  document.getElementById('diff-table').innerHTML    = '';
+  document.getElementById('diff-table').style.display = 'none';
+  document.getElementById('sheet-selector').style.display = 'none';
+  document.getElementById('sheet-select').innerHTML  = '';
+  document.getElementById('download-btn').disabled   = true;
+  document.getElementById('reset-btn').disabled      = true;
+  document.getElementById('file-input').value        = '';
+  setLogStatus('—');
+}
+
+// =============================================================================
+// Events
+// =============================================================================
+document.getElementById('file-input').addEventListener('change', e => {
+  if (e.target.files[0]) handleFile(e.target.files[0]);
+});
+
+const dz = document.getElementById('dropzone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+dz.addEventListener('drop', e => {
+  e.preventDefault();
+  dz.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>
