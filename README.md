@@ -95,3 +95,5 @@ LPC survey spreadsheets contain building records with separate Borough, Block, a
 ## License
 
 MIT — see `LICENSE`.
+
+Developed collaboratively with Claude (Anthropic) as an AI coding assistant. Problem framing, requirements, testing, and iteration were conducted against real LPC survey data.
