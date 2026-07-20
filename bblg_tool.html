@@ -355,6 +355,7 @@
     <div class="stat"><div class="stat-num"        id="s-total">—</div><div class="stat-label">total rows</div></div>
     <div class="stat"><div class="stat-num green"  id="s-filled">—</div><div class="stat-label">BBL filled</div></div>
     <div class="stat"><div class="stat-num yellow" id="s-blank">—</div><div class="stat-label">blank block/lot</div></div>
+    <div class="stat"><div class="stat-num yellow" id="s-flagged">—</div><div class="stat-label">flagged</div></div>
     <div class="stat"><div class="stat-num red"    id="s-err">—</div><div class="stat-label">errors</div></div>
   </div>
 
@@ -502,6 +503,94 @@ function buildBBL(borough, block, lot) {
 }
 
 // =============================================================================
+// Lot value validator
+// NYC lot numbers are 1–9999. Values outside this range indicate a likely
+// data entry error — most commonly a date auto-converted by Excel (e.g.
+// "Aug-16" stored as serial 45885). Returns true if the lot is plausible.
+// =============================================================================
+function isPlausibleLot(lotStr) {
+  const s = String(lotStr).trim();
+  // Reject if it looks like an Excel serial date (number > 9999)
+  const n = parseFloat(s);
+  if (!isNaN(n) && n > 9999) return false;
+  return true;
+}
+
+// =============================================================================
+// Multi-lot BBL construction
+// Handles lot values that contain multiple lots as a comma-separated list
+// ("21, 42") or a numeric range ("5-12").
+//
+// Range expansion is capped at 10 lots. Ranges larger than 10 are likely
+// data entry errors or street address numbers bleeding into the Lot column
+// and are flagged for manual review rather than expanded automatically.
+//
+// Queens hyphenated addresses (e.g. "88-04") are distinguished from lot
+// ranges by checking whether the first number exceeds a plausible lot value
+// (>200 is almost certainly a street address, not a lot number).
+//
+// Returns: BBL string, comma-separated BBL string, or a flag string.
+// =============================================================================
+const RANGE_CAP = 10;
+
+function buildMultiBBL(borough, block, lotRaw) {
+  const b  = parseInt(borough);
+  const bl = parseInt(parseFloat(String(block).trim()));
+  if (isNaN(b) || isNaN(bl)) return null;
+
+  const makeBBL = (lt) => {
+    const n = parseInt(parseFloat(String(lt).trim()));
+    if (isNaN(n)) return null;
+    return `${b}${String(bl).padStart(5, '0')}${String(n).padStart(4, '0')}`;
+  };
+
+  const lotStr = String(lotRaw).trim();
+
+  // Normalize "and" separators to commas: "18 and 19" → "18, 19"
+  const normalizedLot = lotStr.replace(/\s+and\s+/gi, ',');
+
+  // Comma-separated list: "21, 42" or "21,42" or "18 and 19"
+  if (normalizedLot.includes(',')) {
+    const parts = normalizedLot.split(',').map(s => s.trim()).filter(Boolean);
+    const bbls  = parts.map(makeBBL).filter(Boolean);
+    return bbls.length > 0 ? bbls.join(', ') : null;
+  }
+
+  // Use normalizedLot from here on
+  const lotStrN = normalizedLot;
+
+  // Hyphen: could be a range ("5-12") or a Queens address ("88-04")
+  if (lotStrN.includes('-')) {
+    const parts = lotStrN.split('-').map(s => s.trim());
+    if (parts.length === 2) {
+      const a = parseInt(parts[0]);
+      const b2 = parseInt(parts[1]);
+
+      // No threshold check here — lot numbers up to 9999 are valid in NYC.
+      // Large address-range values (e.g. "1101-1103 Lexington Ave") are caught
+      // upstream by isPlausibleLot before reaching buildMultiBBL.
+
+      if (!isNaN(a) && !isNaN(b2) && b2 > a) {
+        const count = b2 - a + 1;
+        if (count > RANGE_CAP) {
+          // Flag for manual review — range is implausibly large
+          return `RANGE_TOO_LARGE:${lotStrN}`;
+        }
+        // Expand the range
+        const bbls = [];
+        for (let i = a; i <= b2; i++) bbls.push(makeBBL(i));
+        return bbls.filter(Boolean).join(', ');
+      }
+    }
+    // Fallback: treat whole string as a single lot value
+    return makeBBL(parts[0]);
+  }
+
+  // Single lot — standard case
+  return makeBBL(lotStrN);
+}
+
+// =============================================================================
 // Excel serial date conversion
 // Excel stores dates as days since January 0, 1900 (with a deliberate
 // leap year bug at 1900-02-29). Serial 25569 = January 1, 1970 (Unix epoch).
@@ -643,9 +732,9 @@ function processWorkbook(wb, filename) {
   const lotIdx     = lotCol     ? headers.indexOf(lotCol)     : -1;
   const boroughIdx = boroughCol ? headers.indexOf(boroughCol) : -1;
 
-  let filled = 0, blank = 0, errs = 0;
+  let filled = 0, blank = 0, errs = 0, flagged = 0;
 
-  const bbls = normRows.map(row => {
+  const bbls = normRows.map((row, ri) => {
     const block   = blockIdx   >= 0 ? row[blockIdx]   : '';
     const lot     = lotIdx     >= 0 ? row[lotIdx]     : '';
     const borough = boroughIdx >= 0
@@ -653,24 +742,52 @@ function processWorkbook(wb, filename) {
       : fixedBorough;
 
     if (!block || String(block).trim() === '') { blank++; return ''; }
+    if (!lot   || String(lot).trim()   === '') { blank++; return ''; }
 
-    const bbl = buildBBL(borough, block, lot);
+    // Check for implausible lot values (likely Excel date auto-conversion)
+    const lotStr = String(lot).trim();
+    if (!lotStr.includes(',') && !isPlausibleLot(lotStr.split('-')[0])) {
+      flagged++;
+      log(`Row ${ri + 2}: lot value "${lotStr}" looks like a date entry error (Excel serial?) — skipping BBL`, 'warn');
+      return `LOT_ERROR:${lotStr}`;
+    }
+
+    const bbl = buildMultiBBL(borough, block, lot);
     if (!bbl) { errs++; return 'ERROR'; }
+
+    if (String(bbl).startsWith('RANGE_TOO_LARGE:')) {
+      flagged++;
+      log(`Row ${ri + 2}: lot range "${String(bbl).split(':')[1]}" exceeds ${RANGE_CAP} — needs manual review`, 'warn');
+      return bbl;
+    }
+
+    if (String(bbl).startsWith('LOT_ERROR:')) {
+      flagged++;
+      log(`Row ${ri + 2}: lot value "${String(bbl).split(':')[1]}" looks like an address range or entry error — skipping BBL`, 'warn');
+      return bbl;
+    }
+
     filled++;
     return bbl;
   });
 
-  log(`BBL filled: ${filled} | Blank block/lot: ${blank} | Errors: ${errs}`, filled > 0 ? 'ok' : 'warn');
+  log(`BBL filled: ${filled} | Blank: ${blank} | Flagged: ${flagged} | Errors: ${errs}`, filled > 0 ? 'ok' : 'warn');
 
   const outHeaders = [...headers, bblColName];
   const outRows    = normRows.map((row, i) => [...row, bbls[i]]);
 
   // Update stats panel
-  document.getElementById('s-total').textContent  = normRows.length;
-  document.getElementById('s-filled').textContent = filled;
-  document.getElementById('s-blank').textContent  = blank;
-  document.getElementById('s-err').textContent    = errs;
+  document.getElementById('s-total').textContent   = normRows.length;
+  document.getElementById('s-filled').textContent  = filled;
+  document.getElementById('s-blank').textContent   = blank;
+  document.getElementById('s-flagged').textContent = flagged;
+  document.getElementById('s-err').textContent     = errs;
   document.getElementById('stats-row').classList.add('active');
+
+  // If there are flagged rows, add a summary block to the log
+  if (flagged > 0) {
+    log(`${flagged} row(s) need manual review — check warnings above for row numbers and values`, 'warn');
+  }
 
   renderPreview(outHeaders, outRows, bblColName);
 
@@ -703,10 +820,13 @@ function processWorkbook(wb, filename) {
 
       const strVal = String(val);
       const forceString = (
-        /^\d+-\d/.test(strVal)               ||  // hyphenated: 88-04, 248-250
-        /^0\d/.test(strVal)                  ||  // leading zero
-        /^\d{2}\/\d{2}\/\d{4}$/.test(strVal)||  // date string MM/DD/YYYY
-        (strVal.length === 10 && /^\d{10}$/.test(strVal))  // 10-digit BBL
+        /^\d+-\d/.test(strVal)                    ||  // hyphenated: 88-04, 248-250
+        /^0\d/.test(strVal)                        ||  // leading zero
+        /^\d{2}\/\d{2}\/\d{4}$/.test(strVal)  ||  // date string MM/DD/YYYY
+        /^\d{10}$/.test(strVal)                    ||  // 10-digit BBL
+        strVal.includes(',')                         ||  // multi-BBL comma list
+        strVal.startsWith('LOT_ERROR')               ||  // flagged lot error
+        strVal.startsWith('RANGE_TOO_LARGE')             // flagged range
       );
 
       if (forceString) {
@@ -931,6 +1051,7 @@ function resetTool() {
   document.getElementById('diff-panel').classList.remove('active');
   document.getElementById('diff-panel').style.display = 'none';
   document.getElementById('stats-row').classList.remove('active');
+  document.getElementById('s-flagged').textContent = '—';
   document.getElementById('log-body').innerHTML      = '';
   document.getElementById('preview-table').innerHTML = '';
   document.getElementById('diff-body').innerHTML     = '';
